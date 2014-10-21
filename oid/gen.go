@@ -11,7 +11,7 @@ import (
 	"os/exec"
 
 	"database/sql"
-	_ "github.com/lib/pq"
+	_ "github.com/VividCortex/pq"
 )
 
 func main() {

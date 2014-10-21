@@ -5,7 +5,7 @@ import (
 	"database/sql/driver"
 	"encoding/hex"
 	"fmt"
-	"github.com/lib/pq/oid"
+	"github.com/VividCortex/pq/oid"
 	"math"
 	"strconv"
 	"strings"
