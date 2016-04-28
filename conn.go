@@ -95,7 +95,7 @@ type defaultDialer struct{}
 
 func (d defaultDialer) Dial(ntw, addr string) (net.Conn, error) {
 	// Check if we have a registered Dialer for this network type.
-	// If not, we'll ue the default dialer instead.
+	// If not, we'll use the default dialer instead.
 	if dial, ok := dials[ntw]; ok {
 		return dial.Dial(ntw, addr)
 	}
@@ -105,7 +105,7 @@ func (d defaultDialer) Dial(ntw, addr string) (net.Conn, error) {
 
 func (d defaultDialer) DialTimeout(ntw, addr string, timeout time.Duration) (net.Conn, error) {
 	// Check if we have a registered Dialer for this network type.
-	// If not, we'll ue the default dialer instead.
+	// If not, we'll use the default dialer instead.
 	if dial, ok := dials[ntw]; ok {
 		return dial.DialTimeout(ntw, addr, timeout)
 	}
