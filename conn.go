@@ -79,12 +79,36 @@ type Dialer interface {
 	DialTimeout(network, address string, timeout time.Duration) (net.Conn, error)
 }
 
+var dialers map[string]Dialer
+
+// RegisterDialer registers a custom dialer. It can then be used by the
+// network address mynet(addr), where mynet is the registered new network.
+func RegisterDialer(net string, dial Dialer) {
+	if dialers == nil {
+		dialers = make(map[string]Dialer)
+	}
+	dialers[net] = dial
+}
+
 type defaultDialer struct{}
 
 func (d defaultDialer) Dial(ntw, addr string) (net.Conn, error) {
+	// Check if we have a registered Dialer for this network type.
+	// If not, we'll use the default dialer instead.
+	if dial, ok := dialers[ntw]; ok {
+		return dial.Dial(ntw, addr)
+	}
+
 	return net.Dial(ntw, addr)
 }
+
 func (d defaultDialer) DialTimeout(ntw, addr string, timeout time.Duration) (net.Conn, error) {
+	// Check if we have a registered Dialer for this network type.
+	// If not, we'll use the default dialer instead.
+	if dial, ok := dialers[ntw]; ok {
+		return dial.DialTimeout(ntw, addr, timeout)
+	}
+
 	return net.DialTimeout(ntw, addr, timeout)
 }
 
@@ -854,9 +878,9 @@ func (cn *conn) verifyCA(client *tls.Conn, tlsConf *tls.Config) {
 	}
 	certs := client.ConnectionState().PeerCertificates
 	opts := x509.VerifyOptions{
-		DNSName: client.ConnectionState().ServerName,
+		DNSName:       client.ConnectionState().ServerName,
 		Intermediates: x509.NewCertPool(),
-		Roots: tlsConf.RootCAs,
+		Roots:         tlsConf.RootCAs,
 	}
 	for i, cert := range certs {
 		if i == 0 {
@@ -869,7 +893,6 @@ func (cn *conn) verifyCA(client *tls.Conn, tlsConf *tls.Config) {
 		panic(err)
 	}
 }
-
 
 // This function sets up SSL client certificates based on either the "sslkey"
 // and "sslcert" settings (possibly set via the environment variables PGSSLKEY
