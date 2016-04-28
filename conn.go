@@ -79,16 +79,15 @@ type Dialer interface {
 	DialTimeout(network, address string, timeout time.Duration) (net.Conn, error)
 }
 
-var dials map[string]Dialer
+var dialers map[string]Dialer
 
-// RegisterDial registers a custom dialer. It can then be used by the
+// RegisterDialer registers a custom dialer. It can then be used by the
 // network address mynet(addr), where mynet is the registered new network.
-// addr is passed as a parameter to the dial function.
-func RegisterDial(net string, dial Dialer) {
-	if dials == nil {
-		dials = make(map[string]Dialer)
+func RegisterDialer(net string, dial Dialer) {
+	if dialers == nil {
+		dialers = make(map[string]Dialer)
 	}
-	dials[net] = dial
+	dialers[net] = dial
 }
 
 type defaultDialer struct{}
@@ -96,7 +95,7 @@ type defaultDialer struct{}
 func (d defaultDialer) Dial(ntw, addr string) (net.Conn, error) {
 	// Check if we have a registered Dialer for this network type.
 	// If not, we'll use the default dialer instead.
-	if dial, ok := dials[ntw]; ok {
+	if dial, ok := dialers[ntw]; ok {
 		return dial.Dial(ntw, addr)
 	}
 
@@ -106,7 +105,7 @@ func (d defaultDialer) Dial(ntw, addr string) (net.Conn, error) {
 func (d defaultDialer) DialTimeout(ntw, addr string, timeout time.Duration) (net.Conn, error) {
 	// Check if we have a registered Dialer for this network type.
 	// If not, we'll use the default dialer instead.
-	if dial, ok := dials[ntw]; ok {
+	if dial, ok := dialers[ntw]; ok {
 		return dial.DialTimeout(ntw, addr, timeout)
 	}
 
