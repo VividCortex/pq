@@ -74,6 +74,22 @@ func (s transactionStatus) String() string {
 	panic("not reached")
 }
 
+// DialFunc is a function which can be used to establish the network connection.
+// Custom dial functions must be registered with RegisterDial
+type DialFunc func(addr string) (net.Conn, error)
+
+var dials map[string]DialFunc
+
+// RegisterDial registers a custom dial function. It can then be used by the
+// network address mynet(addr), where mynet is the registered new network.
+// addr is passed as a parameter to the dial function.
+func RegisterDial(net string, dial DialFunc) {
+	if dials == nil {
+		dials = make(map[string]DialFunc)
+	}
+	dials[net] = dial
+}
+
 type Dialer interface {
 	Dial(network, address string) (net.Conn, error)
 	DialTimeout(network, address string, timeout time.Duration) (net.Conn, error)
@@ -217,28 +233,35 @@ func DialOpen(d Dialer, name string) (_ driver.Conn, err error) {
 func dial(d Dialer, o values) (net.Conn, error) {
 	ntw, addr := network(o)
 
-	timeout := o.Get("connect_timeout")
+	// Check if we have a registered Dialer for this network type.
+	// If not, we'll ue the default dialer that was passed to us instead.
+	if dial, ok := dials[ntw]; ok {
+		return dial(addr)
+	} else {
+		timeout := o.Get("connect_timeout")
 
-	// Zero or not specified means wait indefinitely.
-	if timeout != "" && timeout != "0" {
-		seconds, err := strconv.ParseInt(timeout, 10, 0)
-		if err != nil {
-			return nil, fmt.Errorf("invalid value for parameter connect_timeout: %s", err)
+		// Zero or not specified means wait indefinitely.
+		if timeout != "" && timeout != "0" {
+			seconds, err := strconv.ParseInt(timeout, 10, 0)
+			if err != nil {
+				return nil, fmt.Errorf("invalid value for parameter connect_timeout: %s", err)
+			}
+			duration := time.Duration(seconds) * time.Second
+			// connect_timeout should apply to the entire connection establishment
+			// procedure, so we both use a timeout for the TCP connection
+			// establishment and set a deadline for doing the initial handshake.
+			// The deadline is then reset after startup() is done.
+			deadline := time.Now().Add(duration)
+			conn, err := d.DialTimeout(ntw, addr, duration)
+			if err != nil {
+				return nil, err
+			}
+			err = conn.SetDeadline(deadline)
+			return conn, err
 		}
-		duration := time.Duration(seconds) * time.Second
-		// connect_timeout should apply to the entire connection establishment
-		// procedure, so we both use a timeout for the TCP connection
-		// establishment and set a deadline for doing the initial handshake.
-		// The deadline is then reset after startup() is done.
-		deadline := time.Now().Add(duration)
-		conn, err := d.DialTimeout(ntw, addr, duration)
-		if err != nil {
-			return nil, err
-		}
-		err = conn.SetDeadline(deadline)
-		return conn, err
+
+		return d.Dial(ntw, addr)
 	}
-	return d.Dial(ntw, addr)
 }
 
 func network(o values) (string, string) {
@@ -854,9 +877,9 @@ func (cn *conn) verifyCA(client *tls.Conn, tlsConf *tls.Config) {
 	}
 	certs := client.ConnectionState().PeerCertificates
 	opts := x509.VerifyOptions{
-		DNSName: client.ConnectionState().ServerName,
+		DNSName:       client.ConnectionState().ServerName,
 		Intermediates: x509.NewCertPool(),
-		Roots: tlsConf.RootCAs,
+		Roots:         tlsConf.RootCAs,
 	}
 	for i, cert := range certs {
 		if i == 0 {
@@ -869,7 +892,6 @@ func (cn *conn) verifyCA(client *tls.Conn, tlsConf *tls.Config) {
 		panic(err)
 	}
 }
-
 
 // This function sets up SSL client certificates based on either the "sslkey"
 // and "sslcert" settings (possibly set via the environment variables PGSSLKEY
