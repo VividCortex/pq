@@ -32,6 +32,8 @@ var (
 	ErrSSLKeyHasWorldPermissions = errors.New("pq: Private key file has group or world access. Permissions should be u=rw (0600) or less.")
 )
 
+var PgBouncerCompatibility = false
+
 type drv struct{}
 
 func (d *drv) Open(name string) (driver.Conn, error) {
@@ -166,9 +168,11 @@ func DialOpen(d Dialer, name string) (_ driver.Conn, err error) {
 	// * Explicitly passed connection information
 	o.Set("host", "localhost")
 	o.Set("port", "5432")
-	// N.B.: Extra float digits should be set to 3, but that breaks
-	// Postgres 8.4 and older, where the max is 2.
-	o.Set("extra_float_digits", "2")
+	if !PgBouncerCompatibility {
+		// N.B.: Extra float digits should be set to 3, but that breaks
+		// Postgres 8.4 and older, where the max is 2.
+		o.Set("extra_float_digits", "2")
+	}
 	for k, v := range parseEnviron(os.Environ()) {
 		o.Set(k, v)
 	}
