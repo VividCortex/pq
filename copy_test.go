@@ -3,13 +3,16 @@ package pq
 import (
 	"bytes"
 	"database/sql"
+	"database/sql/driver"
+	"fmt"
+	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCopyInStmt(t *testing.T) {
-	var stmt string
-	stmt = CopyIn("table name")
+	stmt := CopyIn("table name")
 	if stmt != `COPY "table name" () FROM STDIN` {
 		t.Fatal(stmt)
 	}
@@ -26,8 +29,7 @@ func TestCopyInStmt(t *testing.T) {
 }
 
 func TestCopyInSchemaStmt(t *testing.T) {
-	var stmt string
-	stmt = CopyInSchema("schema name", "table name")
+	stmt := CopyInSchema("schema name", "table name")
 	if stmt != `COPY "schema name"."table name" () FROM STDIN` {
 		t.Fatal(stmt)
 	}
@@ -73,6 +75,95 @@ func TestCopyInMultipleValues(t *testing.T) {
 		}
 	}
 
+	result, err := stmt.Exec()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if rowsAffected != 500 {
+		t.Fatalf("expected 500 rows affected, not %d", rowsAffected)
+	}
+
+	err = stmt.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var num int
+	err = txn.QueryRow("SELECT COUNT(*) FROM temp").Scan(&num)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if num != 500 {
+		t.Fatalf("expected 500 items, not %d", num)
+	}
+}
+
+func TestCopyInRaiseStmtTrigger(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	if getServerVersion(t, db) < 90000 {
+		var exists int
+		err := db.QueryRow("SELECT 1 FROM pg_language WHERE lanname = 'plpgsql'").Scan(&exists)
+		if err == sql.ErrNoRows {
+			t.Skip("language PL/PgSQL does not exist; skipping TestCopyInRaiseStmtTrigger")
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txn.Rollback()
+
+	_, err = txn.Exec("CREATE TEMP TABLE temp (a int, b varchar)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = txn.Exec(`
+			CREATE OR REPLACE FUNCTION pg_temp.temptest()
+			RETURNS trigger AS
+			$BODY$ begin
+				raise notice 'Hello world';
+				return new;
+			end $BODY$
+			LANGUAGE plpgsql`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = txn.Exec(`
+			CREATE TRIGGER temptest_trigger
+			BEFORE INSERT
+			ON temp
+			FOR EACH ROW
+			EXECUTE PROCEDURE pg_temp.temptest()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stmt, err := txn.Prepare(CopyIn("temp", "a", "b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	longString := strings.Repeat("#", 500)
+
+	_, err = stmt.Exec(int64(1), longString)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	_, err = stmt.Exec()
 	if err != nil {
 		t.Fatal(err)
@@ -89,8 +180,8 @@ func TestCopyInMultipleValues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if num != 500 {
-		t.Fatalf("expected 500 items, not %d", num)
+	if num != 1 {
+		t.Fatalf("expected 1 items, not %d", num)
 	}
 }
 
@@ -145,7 +236,7 @@ func TestCopyInTypes(t *testing.T) {
 	if text != "Héllö\n ☃!\r\t\\" {
 		t.Fatal("unexpected result", text)
 	}
-	if bytes.Compare(blob, []byte{0, 255, 9, 10, 13}) != 0 {
+	if !bytes.Equal(blob, []byte{0, 255, 9, 10, 13}) {
 		t.Fatal("unexpected result", blob)
 	}
 	if nothing.Valid {
@@ -272,6 +363,93 @@ func TestCopySyntaxError(t *testing.T) {
 	err = txn.Rollback()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Tests for connection errors in copyin.resploop()
+func TestCopyRespLoopConnectionError(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txn.Rollback()
+
+	var pid int
+	err = txn.QueryRow("SELECT pg_backend_pid()").Scan(&pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = txn.Exec("CREATE TEMP TABLE temp (a int)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stmt, err := txn.Prepare(CopyIn("temp", "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Close()
+
+	_, err = db.Exec("SELECT pg_terminate_backend($1)", pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if getServerVersion(t, db) < 90500 {
+		// We have to try and send something over, since postgres before
+		// version 9.5 won't process SIGTERMs while it's waiting for
+		// CopyData/CopyEnd messages; see tcop/postgres.c.
+		_, err = stmt.Exec(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	retry(t, time.Second*5, func() error {
+		_, err = stmt.Exec()
+		if err == nil {
+			return fmt.Errorf("expected error")
+		}
+		return nil
+	})
+	switch pge := err.(type) {
+	case *Error:
+		if pge.Code.Name() != "admin_shutdown" {
+			t.Fatalf("expected admin_shutdown, got %s", pge.Code.Name())
+		}
+	case *net.OpError:
+		// ignore
+	default:
+		if err == driver.ErrBadConn {
+			// likely an EPIPE
+		} else if err == errCopyInClosed {
+			// ignore
+		} else {
+			t.Fatalf("unexpected error, got %+#v", err)
+		}
+	}
+
+	_ = stmt.Close()
+}
+
+// retry executes f in a backoff loop until it doesn't return an error. If this
+// doesn't happen within duration, t.Fatal is called with the latest error.
+func retry(t *testing.T, duration time.Duration, f func() error) {
+	start := time.Now()
+	next := time.Millisecond * 100
+	for {
+		err := f()
+		if err == nil {
+			return
+		}
+		if time.Since(start) > duration {
+			t.Fatal(err)
+		}
+		time.Sleep(next)
+		next *= 2
 	}
 }
 

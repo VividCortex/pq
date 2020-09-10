@@ -1,10 +1,14 @@
 package pq
 
 import (
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
@@ -24,7 +28,6 @@ func expectNotification(t *testing.T, ch <-chan *Notification, relname string, e
 	case <-time.After(1500 * time.Millisecond):
 		return fmt.Errorf("timeout")
 	}
-	panic("not reached")
 }
 
 func expectNoNotification(t *testing.T, ch <-chan *Notification) error {
@@ -34,7 +37,6 @@ func expectNoNotification(t *testing.T, ch <-chan *Notification) error {
 	case <-time.After(100 * time.Millisecond):
 		return nil
 	}
-	panic("not reached")
 }
 
 func expectEvent(t *testing.T, eventch <-chan ListenerEventType, et ListenerEventType) error {
@@ -45,9 +47,8 @@ func expectEvent(t *testing.T, eventch <-chan ListenerEventType, et ListenerEven
 		}
 		return nil
 	case <-time.After(1500 * time.Millisecond):
-		return fmt.Errorf("timeout")
+		panic("expectEvent timeout")
 	}
-	panic("not reached")
 }
 
 func expectNoEvent(t *testing.T, eventch <-chan ListenerEventType) error {
@@ -57,7 +58,6 @@ func expectNoEvent(t *testing.T, eventch <-chan ListenerEventType) error {
 	case <-time.After(100 * time.Millisecond):
 		return nil
 	}
-	panic("not reached")
 }
 
 func newTestListenerConn(t *testing.T) (*ListenerConn, <-chan *Notification) {
@@ -125,6 +125,9 @@ func TestConnUnlisten(t *testing.T) {
 	}
 
 	_, err = db.Exec("NOTIFY notify_test")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	err = expectNotification(t, channel, "notify_test", "")
 	if err != nil {
@@ -161,6 +164,9 @@ func TestConnUnlistenAll(t *testing.T) {
 	}
 
 	_, err = db.Exec("NOTIFY notify_test")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	err = expectNotification(t, channel, "notify_test", "")
 	if err != nil {
@@ -214,13 +220,72 @@ func TestConnPing(t *testing.T) {
 	}
 }
 
+// Test for deadlock where a query fails while another one is queued
+func TestConnExecDeadlock(t *testing.T) {
+	l, _ := newTestListenerConn(t)
+	defer l.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		l.ExecSimpleQuery("SELECT pg_sleep(60)")
+		wg.Done()
+	}()
+	runtime.Gosched()
+	go func() {
+		l.ExecSimpleQuery("SELECT 1")
+		wg.Done()
+	}()
+	// give the two goroutines some time to get into position
+	runtime.Gosched()
+	// calls Close on the net.Conn; equivalent to a network failure
+	l.Close()
+
+	defer time.AfterFunc(10*time.Second, func() {
+		panic("timed out")
+	}).Stop()
+	wg.Wait()
+}
+
+// Test for ListenerConn being closed while a slow query is executing
+func TestListenerConnCloseWhileQueryIsExecuting(t *testing.T) {
+	l, _ := newTestListenerConn(t)
+	defer l.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		sent, err := l.ExecSimpleQuery("SELECT pg_sleep(60)")
+		if sent {
+			panic("expected sent=false")
+		}
+		// could be any of a number of errors
+		if err == nil {
+			panic("expected error")
+		}
+		wg.Done()
+	}()
+	// give the above goroutine some time to get into position
+	runtime.Gosched()
+	err := l.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer time.AfterFunc(10*time.Second, func() {
+		panic("timed out")
+	}).Stop()
+	wg.Wait()
+}
+
 func TestNotifyExtra(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
 	if getServerVersion(t, db) < 90000 {
-		t.Log("skipping test due to old PG version")
-		return
+		t.Skip("skipping NOTIFY payload test since the server does not appear to support it")
 	}
 
 	l, channel := newTestListenerConn(t)
@@ -503,5 +568,45 @@ func TestListenerPing(t *testing.T) {
 	err = l.Ping()
 	if err != errListenerClosed {
 		t.Fatalf("expected errListenerClosed; got %v", err)
+	}
+}
+
+func TestConnectorWithNotificationHandler_Simple(t *testing.T) {
+	b, err := NewConnector("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var notification *Notification
+	// Make connector w/ handler to set the local var
+	c := ConnectorWithNotificationHandler(b, func(n *Notification) { notification = n })
+	sendNotification(c, t, "Test notification #1")
+	if notification == nil || notification.Extra != "Test notification #1" {
+		t.Fatalf("Expected notification w/ message, got %v", notification)
+	}
+	// Unset the handler on the same connector
+	prevC := c
+	if c = ConnectorWithNotificationHandler(c, nil); c != prevC {
+		t.Fatalf("Expected to not create new connector but did")
+	}
+	sendNotification(c, t, "Test notification #2")
+	if notification == nil || notification.Extra != "Test notification #1" {
+		t.Fatalf("Expected notification to not change, got %v", notification)
+	}
+	// Set it back on the same connector
+	if c = ConnectorWithNotificationHandler(c, func(n *Notification) { notification = n }); c != prevC {
+		t.Fatal("Expected to not create new connector but did")
+	}
+	sendNotification(c, t, "Test notification #3")
+	if notification == nil || notification.Extra != "Test notification #3" {
+		t.Fatalf("Expected notification w/ message, got %v", notification)
+	}
+}
+
+func sendNotification(c driver.Connector, t *testing.T, escapedNotification string) {
+	db := sql.OpenDB(c)
+	defer db.Close()
+	sql := fmt.Sprintf("LISTEN foo; NOTIFY foo, '%s';", escapedNotification)
+	if _, err := db.Exec(sql); err != nil {
+		t.Fatal(err)
 	}
 }
