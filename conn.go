@@ -97,14 +97,35 @@ type DialerContext interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }
 
+var dialers map[string]Dialer
+
+// RegisterDialer registers a custom dialer. It can then be used by the
+// network address mynet(addr), where mynet is the registered new network.
+func RegisterDialer(net string, dial Dialer) {
+	if dialers == nil {
+		dialers = make(map[string]Dialer)
+	}
+	dialers[net] = dial
+}
+
 type defaultDialer struct {
 	d net.Dialer
 }
 
 func (d defaultDialer) Dial(network, address string) (net.Conn, error) {
+	// Check if we have a registered Dialer for this network type.
+	// If not, we'll use the default dialer instead.
+	if dial, ok := dialers[network]; ok {
+		return dial.Dial(network, address)
+	}
 	return d.d.Dial(network, address)
 }
 func (d defaultDialer) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	// Check if we have a registered Dialer for this network type.
+	// If not, we'll use the default dialer instead.
+	if dial, ok := dialers[network]; ok {
+		return dial.DialTimeout(network, address, timeout)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return d.DialContext(ctx, network, address)
