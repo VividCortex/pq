@@ -9,6 +9,8 @@ import (
 	"strings"
 )
 
+var PgBouncerCompatibility = false
+
 // Connector represents a fixed configuration for the pq driver with a given
 // name. Connector satisfies the database/sql/driver Connector interface and
 // can be used to create any number of DB Conn's via the database/sql OpenDB
@@ -50,9 +52,11 @@ func NewConnector(dsn string) (*Connector, error) {
 	// * Explicitly passed connection information
 	o["host"] = "localhost"
 	o["port"] = "5432"
-	// N.B.: Extra float digits should be set to 3, but that breaks
-	// Postgres 8.4 and older, where the max is 2.
-	o["extra_float_digits"] = "2"
+	if !PgBouncerCompatibility {
+		// N.B.: Extra float digits should be set to 3, but that breaks
+		// Postgres 8.4 and older, where the max is 2.
+		o["extra_float_digits"] = "2"
+	}
 	for k, v := range parseEnviron(os.Environ()) {
 		o[k] = v
 	}
